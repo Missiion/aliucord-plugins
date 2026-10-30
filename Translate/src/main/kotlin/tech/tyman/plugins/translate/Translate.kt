@@ -2,15 +2,14 @@ package tech.tyman.plugins.translate
 
 import android.content.Context
 import android.graphics.drawable.Drawable
-import android.os.Bundle
 import android.text.Spanned
 import android.text.style.RelativeSizeSpan
+import android.util.TypedValue
 import android.view.View
-import android.widget.LinearLayout
-import android.widget.TextView
+import android.widget.ImageView
+import androidx.constraintlayout.widget.ConstraintLayout
 import androidx.core.content.ContextCompat
-import androidx.core.widget.NestedScrollView
-import com.aliucord.CollectionUtils
+import androidx.core.graphics.drawable.DrawableCompat
 import com.aliucord.Http
 import com.aliucord.Utils
 import com.aliucord.annotations.AliucordPlugin
@@ -18,12 +17,12 @@ import com.aliucord.api.CommandsAPI
 import com.aliucord.entities.Plugin
 import com.aliucord.patcher.Hook
 import com.discord.api.commands.ApplicationCommandType
-import com.discord.databinding.WidgetChatListActionsBinding
+import com.discord.utilities.color.ColorCompat
 import com.discord.utilities.textprocessing.node.EditedMessageNode
 import com.discord.utilities.view.text.SimpleDraweeSpanTextView
 import com.discord.widgets.chat.list.WidgetChatList
-import com.discord.widgets.chat.list.actions.WidgetChatListActions
 import com.discord.widgets.chat.list.adapter.WidgetChatListAdapterItemMessage
+import com.discord.widgets.chat.list.entries.ChatListEntry
 import com.discord.widgets.chat.list.entries.MessageEntry
 import com.facebook.drawee.span.DraweeSpanStringBuilder
 import com.lytefast.flexinput.R
@@ -36,6 +35,8 @@ class Translate : Plugin() {
     lateinit var pluginIcon: Drawable
     private val translatedMessages = mutableMapOf<Long, TranslateSuccessData>()
     private var chatList: WidgetChatList? = null
+    // Messages currently being fetched, to avoid duplicate requests when tapping repeatedly
+    private val translating = mutableSetOf<Long>()
     private val messageLoggerEditedRegex = Pattern.compile("(?:.+ \\(.+: .+\\)\\n)+(.+)\$")
 
     init {
@@ -47,7 +48,7 @@ class Translate : Plugin() {
     }
 
     override fun start(context: Context) {
-        patchMessageContextMenu()
+        patchMessageTranslateButton()
         patchProcessMessageText()
         commands.registerCommand(
                 "translate",
@@ -123,61 +124,110 @@ class Translate : Plugin() {
         })
     }
 
-    private fun patchMessageContextMenu() {
-        val viewId = View.generateViewId()
-        val messageContextMenu = WidgetChatListActions::class.java
-        val getBinding = messageContextMenu.getDeclaredMethod("getBinding").apply { isAccessible = true }
-
-        patcher.patch(messageContextMenu.getDeclaredMethod("configureUI", WidgetChatListActions.Model::class.java), Hook {
-            val menu = it.thisObject as WidgetChatListActions
-            val binding = getBinding.invoke(menu) as WidgetChatListActionsBinding
-            val translateButton = binding.a.findViewById<TextView>(viewId)
-            translateButton.setOnClickListener { _ ->
-                val message = (it.args[0] as WidgetChatListActions.Model).message
-                val translationEntry = translatedMessages[message.id]
-
-                if (translationEntry == null) {
-                    // If not translated yet, fetch and cache the translation, then rerender the message
-                    Utils.threadPool.execute {
-                        val response = translateMessage(message.content)
-                        if (response !is TranslateSuccessData) {
-                            with (response as TranslateErrorData) {
-                                Utils.showToast("$errorText ($errorCode)", true)
-                                return@execute
-                            }
+    /** Translates the message (or toggles original/translated if it was already translated). */
+    private fun toggleTranslation(messageId: Long, content: String) {
+        val translationEntry = translatedMessages[messageId]
+        if (translationEntry == null) {
+            // If not translated yet, fetch and cache the translation, then rerender the message
+            if (!translating.add(messageId)) return
+            Utils.threadPool.execute {
+                try {
+                    val response = translateMessage(content)
+                    if (response !is TranslateSuccessData) {
+                        with(response as TranslateErrorData) {
+                            Utils.showToast("$errorText ($errorCode)", true)
+                            return@execute
                         }
-                        translatedMessages[message.id] = response
-                        chatList?.rerenderMessage(message.id)
-                        Utils.showToast("Translated message")
-                        menu.dismiss()
                     }
-                } else {
-                    // If translated, then no need to translate anything, so just flip the showingOriginal property and rerender
-                    translationEntry.showingOriginal = !translationEntry.showingOriginal
-                    chatList?.rerenderMessage(message.id)
-                    menu.dismiss()
+                    translatedMessages[messageId] = response
+                    chatList?.rerenderMessage(messageId)
+                } catch (e: Throwable) {
+                    logger.error("Failed to translate message", e)
+                    Utils.showToast("Failed to translate message", true)
+                } finally {
+                    translating.remove(messageId)
                 }
             }
-        })
+        } else {
+            // If translated, no need to translate anything, so just flip the showingOriginal property and rerender
+            translationEntry.showingOriginal = !translationEntry.showingOriginal
+            chatList?.rerenderMessage(messageId)
+        }
+    }
 
-        patcher.patch(messageContextMenu, "onViewCreated", arrayOf(View::class.java, Bundle::class.java), Hook {
-            val linearLayout = (it.args[0] as NestedScrollView).getChildAt(0) as LinearLayout
-            val context = linearLayout.context
-            val messageId = WidgetChatListActions.`access$getMessageId$p`(it.thisObject as WidgetChatListActions)
-            linearLayout.addView(TextView(context, null, 0, R.i.UiKit_Settings_Item_Icon).apply {
-                val translationEntry = translatedMessages[messageId]
+    private fun patchMessageTranslateButton() {
+        val buttonTag = "TranslatePluginButton"
+        val messageTextId = Utils.getResId("chat_list_adapter_item_text", "id")
 
-                id = viewId
-                text = if (translationEntry == null || translationEntry.showingOriginal) {
-                    // If not translated yet, or original is currently shown
-                    "Translate message"
-                } else {
-                    // Otherwise, it must be translated and original is not currently being shown
-                    "Show original"
+        patcher.patch(
+            WidgetChatListAdapterItemMessage::class.java,
+            "onConfigure",
+            arrayOf(Int::class.javaPrimitiveType!!, ChatListEntry::class.java),
+            Hook {
+                val holder = it.thisObject as WidgetChatListAdapterItemMessage
+                val layout = holder.itemView as? ConstraintLayout ?: return@Hook
+                val context = layout.context
+                val density = context.resources.displayMetrics.density
+                fun dp(v: Int) = (v * density).toInt()
+
+                val entry = it.args[1] as? MessageEntry
+                val message = entry?.message
+                val content: String? = message?.content
+
+                // Get the existing button (views are recycled) or create it the first time
+                var button = layout.findViewWithTag<ImageView>(buttonTag)
+                if (button == null) {
+                    button = ImageView(context).apply {
+                        tag = buttonTag
+                        id = View.generateViewId()
+                        scaleType = ImageView.ScaleType.CENTER_INSIDE
+                        setPadding(dp(6), dp(6), dp(6), dp(6))
+                        contentDescription = "Translate message"
+                        val outValue = TypedValue()
+                        if (context.theme.resolveAttribute(android.R.attr.selectableItemBackgroundBorderless, outValue, true)) {
+                            setBackgroundResource(outValue.resourceId)
+                        }
+                    }
+                    val params = ConstraintLayout.LayoutParams(dp(32), dp(32)).apply {
+                        endToEnd = ConstraintLayout.LayoutParams.PARENT_ID
+                        // Align with the top of the message text; fall back to the top of the item
+                        if (messageTextId != 0 && layout.findViewById<View>(messageTextId) != null) {
+                            topToTop = messageTextId
+                        } else {
+                            topToTop = ConstraintLayout.LayoutParams.PARENT_ID
+                        }
+                        marginEnd = dp(4)
+                    }
+                    layout.addView(button, params)
                 }
-                setCompoundDrawablesRelativeWithIntrinsicBounds(pluginIcon, null, null, null)
-            })
-        })
+
+                if (message == null || content.isNullOrEmpty()) {
+                    button.visibility = View.GONE
+                    button.setOnClickListener(null)
+                    return@Hook
+                }
+
+                val translationEntry = translatedMessages[message.id]
+                val isTranslated = translationEntry != null && !translationEntry.showingOriginal
+
+                // Fresh drawable per view, tinted: accent colour when the translation is being shown
+                val icon = DrawableCompat.wrap(pluginIcon.constantState!!.newDrawable().mutate())
+                DrawableCompat.setTint(
+                    icon,
+                    ColorCompat.getThemedColor(
+                        context,
+                        if (isTranslated) R.b.colorInteractiveActive else R.b.colorInteractiveNormal
+                    )
+                )
+                button.setImageDrawable(icon)
+                button.alpha = if (isTranslated) 1f else 0.7f
+                button.contentDescription = if (isTranslated) "Show original" else "Translate message"
+                button.visibility = View.VISIBLE
+
+                val messageId = message.id
+                button.setOnClickListener { _ -> toggleTranslation(messageId, content) }
+            }
+        )
     }
 
     override fun stop(context: Context?) = patcher.unpatchAll()
